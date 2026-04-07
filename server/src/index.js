@@ -87,10 +87,11 @@ app.post('/api/places', async (req, res, next) => {
       zip: z.string().min(3),
       country: z.string().min(2).optional().default('US'),
       categories: z.array(z.string().min(1)).min(1),
+      keyword: z.string().optional().default(''),
       radiusMeters: z.number().int().min(500).max(50000).optional().default(5000),
       perCategoryLimit: z.number().int().min(1).max(20).optional().default(10)
     });
-    const { zip, country, categories, radiusMeters, perCategoryLimit } = schema.parse(req.body);
+    const { zip, country, categories, keyword, radiusMeters, perCategoryLimit } = schema.parse(req.body);
 
     const key = requireKey();
 
@@ -109,13 +110,16 @@ app.post('/api/places', async (req, res, next) => {
     const resultsByCategory = {};
     const dedupe = new Map(); // place_id -> place
 
+    const userKeyword = String(keyword || '').trim();
+
     for (const rawCat of categories) {
       const cat = rawCat.trim();
       if (!cat) continue;
-      const keyword = encodeURIComponent(cat);
+      const effectiveKeyword = [cat, userKeyword].filter(Boolean).join(' ').trim();
+      const keywordParam = encodeURIComponent(effectiveKeyword);
       const url = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${encodeURIComponent(
         locationStr
-      )}&radius=${encodeURIComponent(String(radiusMeters))}&keyword=${keyword}&key=${encodeURIComponent(key)}`;
+      )}&radius=${encodeURIComponent(String(radiusMeters))}&keyword=${keywordParam}&key=${encodeURIComponent(key)}`;
 
       const data = await googleGetJson(url);
       assertGoogleOk(data);
@@ -130,11 +134,9 @@ app.post('/api/places', async (req, res, next) => {
           lat: p.geometry?.location?.lat,
           lng: p.geometry?.location?.lng
         },
-        maps_url: p.place_id
-          ? `https://www.google.com/maps/search/?api=1&query_place_id=${encodeURIComponent(
-              p.place_id
-            )}`
-          : null
+        search_keyword: effectiveKeyword,
+        user_keyword: userKeyword,
+        raw: p
       }));
 
       resultsByCategory[cat] = places;
@@ -146,6 +148,7 @@ app.post('/api/places', async (req, res, next) => {
     res.json({
       zip,
       country,
+      keyword: userKeyword,
       center: { lat: loc.lat, lng: loc.lng },
       formatted_address: first.formatted_address,
       resultsByCategory,

@@ -10,12 +10,14 @@ type Place = {
   user_ratings_total?: number;
   types?: string[];
   location: LatLng;
-  maps_url?: string | null;
+  search_keyword?: string;
+  raw?: any;
 };
 
 type PlacesResponse = {
   zip: string;
   country: string;
+  keyword?: string;
   center: LatLng;
   formatted_address: string;
   resultsByCategory: Record<string, Place[]>;
@@ -41,10 +43,12 @@ function uniqCaseInsensitive(list: string[]) {
 export function App() {
   const [zip, setZip] = useState('');
   const country = 'US';
+  const [keyword, setKeyword] = useState('');
   const [categoryDraft, setCategoryDraft] = useState('');
   const [categories, setCategories] = useState<string[]>([]);
   const [radiusMeters, setRadiusMeters] = useState(5000);
   const [perCategoryLimit, setPerCategoryLimit] = useState(8);
+  const [keepExistingEntities, setKeepExistingEntities] = useState(false);
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -93,11 +97,99 @@ export function App() {
     return removedPlaceIds.has(placeId);
   }
 
+  function csvEscape(value: unknown) {
+    const s = value === null || value === undefined ? '' : String(value);
+    const needsQuotes = /[",\n\r]/.test(s);
+    const escaped = s.replace(/"/g, '""');
+    return needsQuotes ? `"${escaped}"` : escaped;
+  }
+
+  function downloadCsv(filename: string, csv: string) {
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function onDownloadCsv() {
+    if (!places) return;
+    const rows: Record<string, unknown>[] = [];
+
+    for (const [category, list] of Object.entries(places.resultsByCategory)) {
+      for (const p of list) {
+        if (isPlaceRemoved(p.place_id)) continue;
+        rows.push({
+          zip: places.zip,
+          country: places.country,
+          keyword: places.keyword ?? '',
+          category,
+          search_keyword: p.search_keyword ?? category,
+          place_id: p.place_id,
+          name: p.name,
+          vicinity: p.vicinity ?? '',
+          rating: p.rating ?? '',
+          user_ratings_total: p.user_ratings_total ?? '',
+          types: Array.isArray(p.types) ? p.types.join('|') : '',
+          lat: p.location?.lat ?? '',
+          lng: p.location?.lng ?? '',
+          google_place_raw_json: p.raw ? JSON.stringify(p.raw) : ''
+        });
+      }
+    }
+
+    const headers = rows.length ? Object.keys(rows[0]) : [];
+    const csv =
+      headers.join(',') +
+      '\n' +
+      rows.map((r) => headers.map((h) => csvEscape(r[h])).join(',')).join('\n') +
+      '\n';
+
+    const safeZip = places.zip.replace(/[^0-9A-Za-z_-]/g, '');
+    downloadCsv(`places_${safeZip || 'zip'}.csv`, csv);
+  }
+
+  function mergePlaces(prev: PlacesResponse, next: PlacesResponse): PlacesResponse {
+    const resultsByCategory: Record<string, Place[]> = { ...prev.resultsByCategory };
+    for (const [cat, list] of Object.entries(next.resultsByCategory)) {
+      const combined = [...(resultsByCategory[cat] || []), ...list];
+      const seen = new Set<string>();
+      resultsByCategory[cat] = combined.filter((p) => {
+        const id = p.place_id || '';
+        if (!id) return false;
+        if (seen.has(id)) return false;
+        seen.add(id);
+        return true;
+      });
+    }
+
+    const uniqueMap = new Map<string, Place>();
+    for (const p of prev.uniquePlaces) uniqueMap.set(p.place_id, p);
+    for (const p of next.uniquePlaces) uniqueMap.set(p.place_id, p);
+
+    return {
+      ...prev,
+      zip: next.zip,
+      country: next.country,
+      keyword: next.keyword,
+      center: next.center,
+      formatted_address: next.formatted_address,
+      resultsByCategory,
+      uniquePlaces: Array.from(uniqueMap.values())
+    };
+  }
+
   async function onSearch() {
     setError(null);
     setRouteLink(null);
-    setPlaces(null);
-    setRemovedPlaceIds(new Set());
+    if (!keepExistingEntities) {
+      setPlaces(null);
+      setRemovedPlaceIds(new Set());
+    }
     setLoading(true);
     try {
       const resp = await fetch('/api/places', {
@@ -106,6 +198,7 @@ export function App() {
         body: JSON.stringify({
           zip: zip.trim(),
           country,
+          keyword: keyword.trim(),
           categories: normalizedCategories,
           radiusMeters,
           perCategoryLimit
@@ -113,7 +206,10 @@ export function App() {
       });
       const data = await resp.json();
       if (!resp.ok) throw new Error(data?.error || 'Failed to fetch places');
-      setPlaces(data);
+      setPlaces((prev) => {
+        if (keepExistingEntities && prev) return mergePlaces(prev, data);
+        return data;
+      });
     } catch (e: any) {
       setError(e?.message || String(e));
     } finally {
@@ -172,6 +268,15 @@ export function App() {
             <div className="label">Country</div>
             <div className="readonlyValue">{country}</div>
           </div>
+
+          <label className="field">
+            <div className="label">Keyword (optional)</div>
+            <input
+              value={keyword}
+              onChange={(e) => setKeyword(e.target.value)}
+              placeholder="e.g. korean, vegan, open late"
+            />
+          </label>
 
           <label className="field">
             <div className="label">Radius (meters)</div>
@@ -260,6 +365,15 @@ export function App() {
             {loading ? 'Searching…' : 'Search places'}
           </button>
 
+          <button
+            className={`btn ${keepExistingEntities ? 'btnToggleOn' : ''}`}
+            type="button"
+            aria-pressed={keepExistingEntities}
+            onClick={() => setKeepExistingEntities((v) => !v)}
+          >
+            Keep existing entities
+          </button>
+
           <button className="btn" onClick={onBuildRoute} disabled={!places || routeLoading}>
             {routeLoading ? 'Building route…' : 'Generate best route link'}
           </button>
@@ -285,6 +399,9 @@ export function App() {
                 <b>{places.uniquePlaces.length}</b>
               </div>
             </div>
+            <button className="btn" type="button" onClick={onDownloadCsv}>
+              Download CSV
+            </button>
           </div>
 
           <div className="columns">
